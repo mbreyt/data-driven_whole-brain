@@ -1,0 +1,141 @@
+import jax, sys, os, shutil, re, optax
+import jax.numpy as jnp
+import numpy as np
+from scripts.python.ml_models import TVB, Simple_MLP, MontBrio, Simple_MLP_additive_c
+from flax.training import train_state, checkpoints
+import flax.linen as nn
+import jax.random as random
+from functools import partial
+from flax import jax_utils
+import time, collections
+# from joblib import Parallel, delayed
+import scipy.stats as st
+from vbi.feature_extraction import *
+
+sub = 'sub-003'
+home_dir = '/Users/martinbreyton/INS_Code/data-driven_whole-brain/data'
+basedir = os.path.join(home_dir, 'results', 'gt_J15')
+atlas_LUT = f'{home_dir}/Schaefer2018_100Parcels_7Networks_order_LUT.txt'
+lut_aseg  = np.genfromtxt(atlas_LUT, usecols=0, dtype=int)[1:101]
+lut_names = np.genfromtxt(atlas_LUT, usecols=1, dtype=str)[1:101]
+names = ['_'.join(name.split('_')[1:3]) for name in lut_names]
+names_idx = sorted([names.index(name) for name in set(names)])
+names_idx.append(100)
+n_nodes = 100
+
+def get_features(ts, fc_stream, names_idx, win_len, win_sp):
+    ts2 = ts.copy()
+    ts = st.zscore(ts, axis=0)
+    k = (float(win_len)/(float(win_len)-float(win_len-win_sp)))+1
+    temp = []
+    fc = np.corrcoef(ts.T)
+    sum_fc = np.sum(fc)
+    var_fc = np.var(fc)
+    triu_idx = np.triu_indices_from(fc, 1)
+    triu_fc_stream = fc_stream[:,triu_idx[0], triu_idx[1]]
+    fcd = np.corrcoef(triu_fc_stream)
+    fl = np.var(fcd[np.triu_indices_from(fcd, k)])
+    sk = st.skew(fcd[np.triu_indices_from(fcd, k)])
+    fcd_min = np.min(fcd[np.triu_indices_from(fcd, k)])
+    fcd_max = np.max(fcd[np.triu_indices_from(fcd, k)])
+    temp += [sum_fc, var_fc, fl, fcd_min, fcd_max, sk]
+    vbi_feats, vbi_labels = features_utils.matrix_stat(fc)
+    temp += vbi_feats
+    vbi_feats, vbi_labels = features_utils.matrix_stat(fcd, k = k)
+    temp += vbi_feats
+    for i in range(len(names_idx)-1):
+        k = (float(win_len)/(float(win_len)-float(win_len-win_sp)))+1
+        fc = np.corrcoef(ts.T)
+        net_start = names_idx[i]
+        net_stop = names_idx[i+1]
+    
+        # static fc
+        net_triu_idx = np.triu_indices_from(fc[net_start:net_stop,net_start:net_stop], 1) # get triangle of network fc diagonal block      
+        in_fc = np.sum(fc[net_start:net_stop,net_start:net_stop][net_triu_idx]) # sum segregated fc
+    
+        fc[net_start:net_stop,net_start:net_stop] = 0
+        out_fc = np.sum(fc[net_start:net_stop,:]) # sum integrated fc after zeroing block
+        
+        # fc stream
+        sub_fcs_in = fc_stream[:,net_start:net_stop,net_start:net_stop] # select diagonal block
+        r, c = np.triu_indices_from(sub_fcs_in[0], 1)
+        sub_fcd_in = sub_fcs_in[:,r, c]
+        sub_fcd_in = np.corrcoef(sub_fcd_in) # segregated fcd
+        in_fl = np.var(sub_fcd_in[np.triu_indices_from(sub_fcd_in, k)]) # segregated fluidity
+        in_sk = st.skew(sub_fcd_in[np.triu_indices_from(sub_fcd_in, k)]) # segregated skewness
+        in_max = np.max(sub_fcd_in[np.triu_indices_from(sub_fcd_in, k)]) # segregated max
+        in_min = np.min(sub_fcd_in[np.triu_indices_from(sub_fcd_in, k)]) # segregated min
+        sub_fcs_out = np.concatenate([fc_stream[:,net_start:net_stop,:net_start], fc_stream[:,net_start:net_stop,net_stop:]], axis=2) # row without diag block
+        sub_fcd_out = sub_fcs_out.reshape((sub_fcs_out.shape[0], -1))
+        sub_fcd_out = np.corrcoef(sub_fcd_out) # integrated fcd
+        out_fl = np.var(sub_fcd_out[np.triu_indices_from(sub_fcd_out, k)])
+        out_sk = st.skew(sub_fcd_out[np.triu_indices_from(sub_fcd_out, k)])
+        out_max = np.max(sub_fcd_out[np.triu_indices_from(sub_fcd_out, k)])
+        out_min = np.min(sub_fcd_out[np.triu_indices_from(sub_fcd_out, k)])
+        temp +=[in_fc, in_fl, in_sk, in_min, in_max, out_fc, out_fl, out_sk, out_min, out_max]
+    temp += ((ts[:-1] * ts[1:]) < 0).sum(axis=0).tolist()
+    temp += np.min(ts, axis=0).tolist()
+    temp += np.max(ts, axis=0).tolist()
+    temp += np.mean(ts2, axis=0).tolist()
+    temp += np.var(ts2, axis=0).tolist()
+
+    return np.array(temp)
+
+
+win_len = 15
+win_sp = 2
+
+
+
+
+@jax.jit
+def fcd_fun_bold(c, x):
+    win_len = 15
+    win_sp = 2
+    get = jax.lax.dynamic_slice
+    x = x[0].astype(int)
+    ts = get(c, (x, 0), (win_len, n_nodes))
+    fc = jnp.corrcoef(ts.squeeze().T)
+    return c, (fc[jnp.triu_indices_from(fc, k=1)], fc)
+
+@jax.jit
+def get_metrics(ts):
+    win_len = 15
+    win_sp = 2
+    x_range = jnp.arange(0, ts.shape[0]-win_len, win_sp)[...,None]
+    c, (fc, fc_stream) = jax.lax.scan(fcd_fun_bold, ts, x_range)
+    return fc_stream
+
+N_simulation = 500
+SEEDS = [f"{int(seed)}" for seed in np.arange(N_simulation)]
+
+
+rule all:
+    input:
+        expand(
+                os.path.join(basedir,"mlp_qif_internal/feat_mlp_qif_internal_seed{seed}.npz"),
+                seed = SEEDS,
+        )
+
+
+
+rule mlp_qif_internal:
+    output:
+        expand(
+            os.path.join(basedir,"mlp_qif_internal/feat_mlp_qif_internal_seed{{seed}}.npz"),
+            seed = SEEDS,
+        ),
+    input:
+        expand(
+            os.path.join(basedir,"mlp_qif_internal/mlp_qif_internal_seed{{seed}}.npz"),
+            seed = SEEDS,
+        ),
+    run:
+        sims = np.load(input[0], mmap_mode='r')['bold'][:,10:,:,0]
+        fc_streams = jax.pmap(get_metrics)(jnp.array(sims))
+        bold_feat = []
+        for ts, fc_stream in zip(sims, fc_streams):
+            feats = get_features(ts, fc_stream, names_idx, win_len, win_sp)
+            bold_feat.append(feats)
+
+        np.savez(output[0], bold=np.array(bold_feat))

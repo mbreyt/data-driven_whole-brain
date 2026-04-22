@@ -1,0 +1,215 @@
+import jax, sys, os, shutil, re, optax
+import jax.numpy as jnp
+import numpy as np
+from vbjax.ml_models import TVB, Simple_MLP, MontBrio, Simple_MLP_additive_c
+from flax.training import train_state, checkpoints
+import flax.linen as nn
+import vbjax as vb
+import jax.random as random
+from functools import partial
+from flax import jax_utils
+import time, collections
+import orbax
+
+DelayHelper = namedtuple('DelayHelper', 'Wt lags ix_lag_from max_lag n_to n_from')
+
+def make_delay_helper(weights, lengths, dt=0.1, v_c=10.0) -> DelayHelper:
+    """Construct a helper with auxiliary variables for applying 
+    delays to a buffer.
+    """
+    n_to, n_from = weights.shape
+    lags = jp.floor(lengths / v_c / dt).astype('i')
+    ix_lag_from = jp.tile(jp.r_[:n_from], (n_to, 1))
+    max_lag = lags.max() + 1
+    Wt = weights.T[:,:,None] # enable bcast for coupling vars
+    dh = DelayHelper(Wt, lags, ix_lag_from, max_lag, n_to, n_from)
+    return dh
+
+sub = 'sub-003'
+basedir = os.path.join(
+        f'/p/scratch/vbt/martin/flax/{sub}/sbi_homogeneous_fixed_g_redo'
+)
+home_dir = '/p/project1/vbt/breyton1'
+atlas_LUT = f'{home_dir}/sub-008/Schaefer2018_100Parcels_7Networks_order_LUT.txt'
+lut_aseg  = np.genfromtxt(atlas_LUT, usecols=0, dtype=int)[1:101]
+lut_names = np.genfromtxt(atlas_LUT, usecols=1, dtype=str)[1:101]
+names = ['_'.join(name.split('_')[1:3]) for name in lut_names]
+names_idx = sorted([names.index(name) for name in set(names)])
+names_idx.append(100)
+
+dt= .01
+v_c= 20.
+W = np.loadtxt(f'{home_dir}/scz-connectomes/{sub}/weights.txt')
+np.fill_diagonal(W, 0.)
+n_nodes = 100
+W = W[:n_nodes, :n_nodes]
+W = W/W.max()
+
+L = np.loadtxt(f'{home_dir}/scz-connectomes/{sub}/lengths.txt')
+L = L[:n_nodes, :n_nodes]
+dh = make_delay_helper(weights=W, lengths=L, dt=dt, v_c=v_c)
+
+
+@jax.jit
+def gfun(x, sqrt_dt, nsig=0.034):
+    steps, nodes, stvar = x.shape
+    sigs = jnp.tile(jnp.sqrt(2*jnp.array([nsig, 2*nsig])), (steps, nodes, 1))
+    return x*sqrt_dt*sigs
+
+@jax.jit
+def mpr_r_positive(rv):
+    r, v = rv[:,0:1], rv[:,1:]
+    return jnp.c_[ r*(r>0), v ]
+
+SIM_LEN = 6000
+N_simulation = 400
+SEEDS = [f"{int(seed)}" for seed in np.arange(1000)]
+SEEDS2 = [f"{int(seed)}" for seed in np.arange(4000)]
+SEEDS3 = [f"{int(seed)}" for seed in np.arange(10)]
+TR = 2000
+ 
+rule all:
+    input:
+        expand(
+                os.path.join(basedir,"mlp_qif_internal/mlp_qif_internal_seed{seed}.npz"),
+                seed = SEEDS2,
+        ),
+        expand(
+                os.path.join(basedir,"mlp_qif_internal_fixed_p/mlp_qif_internal_fixed_p_seed{seed}.npz"),
+                seed = SEEDS3,
+        ),
+        expand(
+                os.path.join(basedir,"mpr/mpr_seed{seed}.npz"),
+                seed = SEEDS,
+        ),
+
+
+
+rule mlp_qif_internal_fixed_p:
+    output:
+        expand(
+                os.path.join(basedir,"mlp_qif_internal_fixed_p/mlp_qif_internal_fixed_p_seed{{seed}}.npz"),
+                seed = SEEDS,
+        ),
+    run:
+        seed = int(wildcards.seed)
+        tvb_p = {
+            'dh': dh,
+            'W': W
+        }
+        np.random.seed(seed)
+        gs = np.random.uniform(.2, 1., size=(jax.device_count(), 1, 1))*0+0.55
+        etas = np.ones((jax.device_count(), 7, 1))*np.random.uniform(-6, -2.5, size=(jax.device_count(), 1, 1))
+        js = np.ones((jax.device_count(), 7, 1))*np.random.uniform(8, 20, size=(jax.device_count(), 1, 1))
+
+        
+        lh = np.repeat(js, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(js, np.diff(np.array(names_idx[7:])-50), axis=1)
+        js = np.concatenate([lh, rh], axis=1)
+
+        lh = np.repeat(etas, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(etas, np.diff(np.array(names_idx[7:])-50), axis=1)
+        etas = np.concatenate([lh, rh], axis=1)
+
+        seeds = np.random.randint(0, 2**32, size=(jax.device_count(),))
+        np.savez(os.path.join(f'/p/scratch/vbt/martin/flax/{sub}/sbi_homogeneous_fixed_g', f'params_mlp_qif_internal_fixed_p_homogeneous_seed{seed}_{sub}.npz'), gs=gs, js=js, etas=etas)
+
+        ckpt_dir = f'{home_dir}/trained_models/smooth_zoom_split_augmented_50'
+        orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        dfun_params = orbax_checkpointer.restore(ckpt_dir+f'/tmp/checkpoint_36')
+        print(ckpt_dir)
+        print(jax.tree_util.tree_map(jnp.shape, dfun_params))
+
+        n_hidden = [6,6]
+        mdl = Simple_MLP(2, n_hidden, nn.tanh, coupled=True, scaling_factor=10)
+        tvb = TVB(tvb_p, dfun=mdl.apply, dfun_pars={'params': dfun_params['dfun']}, nst_vars=2, n_pars=0, gfun=gfun, dt=dt, adhoc=mpr_r_positive, bold_buf_size=TR, bold_dt=.1, tavg_period=.1)
+        p_apply = jax.pmap(lambda eta, j, g, seed: tvb.apply({}, jnp.c_[eta, jnp.repeat(jnp.array([[1.]]), n_nodes, axis=0), j], g, sim_len=SIM_LEN, seed=seed, mlp=True, stimulus_yn=False), axis_name='batch')
+        rvs, bold = p_apply(etas, js, gs, seeds)
+        jax.block_until_ready(bold)
+        np.savez(output[0], bold=bold)
+
+
+
+rule mpr:
+    output:
+        expand(
+                os.path.join(basedir,"mpr/mpr_seed{{seed}}.npz"),
+                seed = SEEDS,
+        ),
+    run:
+        seed = int(wildcards.seed)
+        tvb_p = {
+            'dh': dh,
+            'W': W
+        }
+        np.random.seed(seed)
+        gs = np.random.uniform(.2, 1., size=(jax.device_count(), 1, 1))*0+0.55
+        etas = np.ones((jax.device_count(), 7, 1))*np.random.uniform(-6, -2.5, size=(jax.device_count(), 1, 1))
+        js = np.ones((jax.device_count(), 7, 1))*np.random.uniform(8, 20, size=(jax.device_count(), 1, 1))
+        
+        lh = np.repeat(js, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(js, np.diff(np.array(names_idx[7:])-50), axis=1)
+        js = np.concatenate([lh, rh], axis=1)
+
+        lh = np.repeat(etas, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(etas, np.diff(np.array(names_idx[7:])-50), axis=1)
+        etas = np.concatenate([lh, rh], axis=1)
+
+        seeds = np.random.randint(0, 2**32, size=(jax.device_count(),))
+        np.savez(os.path.join(f'/p/scratch/vbt/martin/flax/{sub}/sbi_homogeneous_fixed_g',  f'params_mpr_homogeneous_seed{seed}_{sub}.npz'), gs=gs, js=js, etas=etas)
+
+
+        dfun = MontBrio(coupled=True)
+        tvb = TVB(tvb_p, dfun=dfun, nst_vars=2, n_pars=0, gfun=gfun, dt=dt, adhoc=mpr_r_positive, bold_buf_size=TR, bold_dt=.1, tavg_period=.1)
+        p_apply = jax.pmap(lambda j, eta, g, seed: tvb.apply({}, jnp.c_[eta, j], g, sim_len=SIM_LEN, seed=seed, mlp=False, stimulus_yn=False), axis_name='batch')
+        rvs, bold = p_apply(js, etas, gs, seeds)
+        jax.block_until_ready(bold)
+        np.savez(output[0], bold=bold)
+
+
+rule mlp_qif_internal:
+    output:
+        expand(
+                os.path.join(basedir,"mlp_qif_internal/mlp_qif_internal_seed{{seed}}.npz"),
+                seed = SEEDS2,
+        ),
+    run:
+        seed = int(wildcards.seed)
+        tvb_p = {
+            'dh': dh,
+            'W': W
+        }
+        np.random.seed(seed)
+        gs = np.random.uniform(.2, 1., size=(jax.device_count(), 1, 1))*0+0.55
+        etas = np.ones((jax.device_count(), 7, 1))*np.random.uniform(-6, -2.5, size=(jax.device_count(), 1, 1))
+        js = np.ones((jax.device_count(), 7, 1))*np.random.uniform(8, 20, size=(jax.device_count(), 1, 1))
+        ps = np.ones((jax.device_count(), 7, 1))*np.random.uniform(.6, 1., size=(jax.device_count(), 1, 1))
+        
+        lh = np.repeat(js, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(js, np.diff(np.array(names_idx[7:])-50), axis=1)
+        js = np.concatenate([lh, rh], axis=1)
+
+        lh = np.repeat(etas, np.diff(names_idx[:8]), axis=1)
+        rh = np.repeat(etas, np.diff(np.array(names_idx[7:])-50), axis=1)
+        etas = np.concatenate([lh, rh], axis=1)
+
+        lh_p = np.repeat(ps, np.diff(names_idx[:8]), axis=1)
+        rh_p = np.repeat(ps, np.diff(np.array(names_idx[7:])-50), axis=1)
+        ps = np.concatenate([lh_p, rh_p], axis=1)
+
+        seeds = np.random.randint(0, 2**32, size=(jax.device_count(),))
+        np.savez(os.path.join(f'/p/scratch/vbt/martin/flax/{sub}/sbi_homogeneous_fixed_g',  f'params_mlp_qif_internal_homogeneous_seed{seed}_{sub}.npz'), gs=gs, js=js, etas=etas, ps=ps)
+
+        ckpt_dir = f'{home_dir}/trained_models/smooth_zoom_split_augmented_50'
+        orbax_checkpointer = orbax.checkpoint.PyTreeCheckpointer()
+        dfun_params = orbax_checkpointer.restore(ckpt_dir+f'/tmp/checkpoint_36')
+        print(ckpt_dir)
+        print(jax.tree_util.tree_map(jnp.shape, dfun_params))
+
+        n_hidden = [6,6]
+        mdl = Simple_MLP(2, n_hidden, nn.tanh, coupled=True, scaling_factor=10)
+        tvb = TVB(tvb_p, dfun=mdl.apply, dfun_pars={'params': dfun_params['dfun']}, nst_vars=2, n_pars=0, gfun=gfun, dt=dt, adhoc=mpr_r_positive, bold_buf_size=TR, bold_dt=.1, tavg_period=.1)
+        p_apply = jax.pmap(lambda eta, j, p, g, seed: tvb.apply({}, jnp.c_[eta, p, j], g, sim_len=SIM_LEN, seed=seed, mlp=True, stimulus_yn=False), axis_name='batch')
+        rvs, bold = p_apply(etas, js, ps, gs, seeds)
+        jax.block_until_ready(bold)
+        np.savez(output[0], bold=bold)
