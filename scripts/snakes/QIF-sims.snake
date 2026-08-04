@@ -1,0 +1,65 @@
+import numpy as np
+import os
+import pickle as cPickle
+import re
+import time
+import sys
+from pathlib import Path
+
+# Run from the repository root:  snakemake -s scripts/snakes/QIF-sims.snake
+sys.path.insert(0, str(Path(workflow.basedir).resolve().parents[1]))
+from scripts.python.config import SCRATCH_DIR
+from scripts.python.qif_sim_utils import ProgressBar, run_qif
+
+# Output root. Set WHOLE_BRAIN_SCRATCH_DIR to write to cluster scratch, e.g.
+#   export WHOLE_BRAIN_SCRATCH_DIR=/p/scratch/martin
+basedir = str(SCRATCH_DIR / 'QIF_sims')
+os.makedirs(basedir, exist_ok=True)
+
+
+JS = [f"{J:.03f}" for J in np.linspace(0, 20, 20)]
+ETAS = [f"{eta:.2f}" for eta in np.arange(-10, 0, .1)]
+SEEDS = [f'{int(seed)}' for seed in np.arange(0, 5, 1)]
+PS = [f'{p:.2f}' for p in np.arange(0.6, 1.05, .5)]
+
+
+rule all:
+    input:
+        expand(
+                os.path.join(basedir,"QIF_sim_J{J}_eta{eta}_seed{seed_p}_p{p}.npz"),
+                J = JS,
+                eta = ETAS,
+                seed_p = SEEDS,
+                p = PS
+        ),
+
+
+rule sim:
+    output:
+        expand(
+            os.path.join(basedir,"QIF_sim_J{{J}}_eta{{eta}}_seed{{seed_p}}_p{{p}}.npz"),
+            J=JS,
+            eta=ETAS,
+            seed_p = SEEDS,
+            p = PS
+        )
+    run:
+        J = float(wildcards.J)
+        eta = float(wildcards.eta)
+        seed_p = int(wildcards.seed_p)
+        p = float(wildcards.p)
+        start_f = time.time()
+        actual_seed = seed_p*np.random.choice(np.arange(10000000))
+        rslt = run_qif(J, eta, 0., 60, seed_p=actual_seed, p=p, exponent=1.1, run_fre_yn=True, sigma=3)
+        end_f = time.time()
+        print(f'full sim = {end_f-start_f} seconds')
+        np.savez(output[0],
+            data=rslt,
+            seed=actual_seed
+        )
+        del rslt
+
+
+
+
+

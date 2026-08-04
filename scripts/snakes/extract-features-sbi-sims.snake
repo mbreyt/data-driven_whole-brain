@@ -1,0 +1,140 @@
+import jax, sys, os, shutil, re, optax
+from pathlib import Path
+
+# Run from the repository root:
+#   snakemake -s scripts/snakes/extract-features-sbi-sims.snake
+# This must precede the `scripts.python.*` imports below.
+sys.path.insert(0, str(Path(workflow.basedir).resolve().parents[1]))
+
+import jax.numpy as jnp
+import numpy as np
+from scripts.python.ml_models import TVB, Simple_MLP, MontBrio, Simple_MLP_additive_c
+from scripts.python.config import ATLAS_LUT, SCRATCH_DIR, SUBJECT
+from scripts.python.features import get_features_sims, get_metrics
+from flax.training import train_state, checkpoints
+import flax.linen as nn
+import jax.random as random
+from functools import partial
+from flax import jax_utils
+import time, collections
+import scipy.stats as st
+import orbax
+
+sub = SUBJECT
+
+# Input/output root: the simulations produced by sbi-sims.snake.
+# Set WHOLE_BRAIN_SCRATCH_DIR to wherever those were written.
+basedir = str(SCRATCH_DIR / sub / 'sbi_homogeneous')
+
+atlas_LUT = str(ATLAS_LUT)
+lut_aseg  = np.genfromtxt(atlas_LUT, usecols=0, dtype=int)[1:101]
+lut_names = np.genfromtxt(atlas_LUT, usecols=1, dtype=str)[1:101]
+names = ['_'.join(name.split('_')[1:3]) for name in lut_names]
+names_idx = sorted([names.index(name) for name in set(names)])
+names_idx.append(100)
+n_nodes = 100
+
+# Feature extraction (get_features_sims, get_metrics) lives in
+# scripts/python/features.py, imported above. See that module for the
+# simulation-vs-empirical feature-set distinction.
+win_len = 15
+win_sp = 2
+
+
+
+# SEEDS = [f"{int(seed)}" for seed in np.arange(1000)]
+SEEDS = [f"{int(seed)}" for seed in np.arange(300)]
+# SEEDS2 = [f"{int(seed)}" for seed in np.arange(4000)]
+SEEDS2 = [f"{int(seed)}" for seed in np.arange(750)]
+SEEDS3 = [f"{int(seed)}" for seed in np.arange(10)]
+TR = 2000
+ 
+rule all:
+    input:
+        expand(
+                os.path.join(basedir,"mlp/feats/feats_mlp_qif_internal_seed{seed}.npz"),
+                seed = SEEDS2,
+        ),
+        expand(
+                os.path.join(basedir,"mlp_p1/feats/feats_mlp_qif_internal_fixed_p_seed{seed}.npz"),
+                seed = SEEDS3,
+        ),
+        expand(
+                os.path.join(basedir,"mpr/feats/feats_mpr_seed{seed}.npz"),
+                seed = SEEDS,
+        ),
+
+
+
+rule mlp_qif_internal_fixed_p:
+    input:
+        expand(
+                os.path.join(basedir,"mlp_p1/sims/mlp_qif_internal_fixed_p_seed{seed}.npz"),
+                seed = SEEDS3,
+        ),
+    output:
+        expand(
+                os.path.join(basedir,"mlp_p1/feats/feats_mlp_qif_internal_fixed_p_seed{{seed}}.npz"),
+                seed = SEEDS3,
+        ),
+    run:
+        sims = np.load(input[0], mmap_mode='r')['bold'][:,10:,:,0]
+        fc_streams = jax.vmap(get_metrics)(jnp.array(sims))
+        bold_feat = []
+        for ts, fc_stream in zip(sims, fc_streams):
+            feats = get_features_sims(ts, fc_stream, names_idx, win_len, win_sp)
+            print(feats.shape[0])
+            bold_feat.append(feats)
+
+        np.savez(output[0], bold=np.array(bold_feat))
+
+
+
+rule mpr:
+    input:
+        expand(
+            os.path.join(basedir,"mpr/sims/mpr_seed{{seed}}.npz"),
+            seed = SEEDS,
+        ),
+    output:
+        expand(
+                os.path.join(basedir,"mpr/feats/feats_mpr_seed{{seed}}.npz"),
+                seed = SEEDS,
+        ),
+    run:
+        sims = np.load(input[0], mmap_mode='r')['bold'][:,10:,:,0]
+        fc_streams = jax.vmap(get_metrics)(jnp.array(sims))
+        bold_feat = []
+        for ts, fc_stream in zip(sims, fc_streams):
+            feats = get_features_sims(ts, fc_stream, names_idx, win_len, win_sp)
+            print(feats.shape[0])
+            if feats.shape[0] != 700:
+                feats = np.zeros(700)
+                feats[:]= np.nan
+            bold_feat.append(feats)
+
+
+        np.savez(output[0], bold=np.array(bold_feat))
+
+
+rule mlp_qif_internal:
+    input:
+        expand(
+            os.path.join(basedir,"mlp/sims/mlp_qif_internal_seed{{seed}}.npz"),
+            seed = SEEDS2,
+        ),
+    output:
+        expand(
+                os.path.join(basedir,"mlp/feats/feats_mlp_qif_internal_seed{{seed}}.npz"),
+                seed = SEEDS2,
+        ),
+    run:
+        sims = np.load(input[0], mmap_mode='r')['bold'][:,10:,:,0]
+        fc_streams = jax.vmap(get_metrics)(jnp.array(sims))
+        bold_feat = []
+        for ts, fc_stream in zip(sims, fc_streams):
+            feats = get_features_sims(ts, fc_stream, names_idx, win_len, win_sp)
+            print(feats.shape[0])
+            bold_feat.append(feats)
+
+        np.savez(output[0], bold=np.array(bold_feat))

@@ -14,6 +14,19 @@ from flax.core.frozen_dict import freeze, unfreeze
 DelayHelper = namedtuple('DelayHelper', 'Wt lags ix_lag_from max_lag n_to n_from')
 
 
+def make_delay_helper(weights, lengths, dt=0.1, v_c=10.0) -> DelayHelper:
+    """Construct a helper with auxiliary variables for applying 
+    delays to a buffer.
+    """
+    n_to, n_from = weights.shape
+    lags = jnp.floor(lengths / v_c / dt).astype('i')
+    ix_lag_from = jnp.tile(jnp.r_[:n_from], (n_to, 1))
+    max_lag = lags.max() + 1
+    Wt = weights.T[:,:,None] # enable bcast for coupling vars
+    dh = DelayHelper(Wt, lags, ix_lag_from, max_lag, n_to, n_from)
+    return dh
+
+
 class Heun_step(nn.Module):
     dfun: Callable
     adhoc: Callable
@@ -366,7 +379,6 @@ class Additive_c(nn.Module):
 
 
 class MontBrio(nn.Module):
-    # dfun_pars: None #Optional[defaultdict] = mpr_default_theta
     dfun_pars: Optional[defaultdict] = None
     coupled: bool = False
     scaling_factor: float = 1.

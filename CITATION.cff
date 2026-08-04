@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software or data, please cite both the software and the associated manuscript (once available)."
+title: "Data-driven mean-field within whole-brain models"
+authors:
+  - family-names: Breyton
+    given-names: Martin
+    orcid: "https://orcid.org/0000-0002-7979-3861"
+license: Apache-2.0
+repository-code: "https://github.com/mbreyt/data-driven_whole-brain"
+type: software
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.19821612
+    description: "Zenodo archive of the simulation datasets"
+references:
+  - type: data
+    title: "Data-driven mean-field within whole-brain models (datasets)"
+    authors:
+      - family-names: Breyton
+        given-names: Martin
+    doi: 10.5281/zenodo.19821612
+    year: 2026
+# Manuscript is under review; add a `preferred-citation:` block with the article
+# DOI and full author list on acceptance.

@@ -1,0 +1,35 @@
+# Python dependencies for the analysis, figures and simulation workflows.
+# Versions are pinned to those used to produce the paper (Python 3.12).
+#
+#   python -m venv env && source env/bin/activate
+#   pip install -r requirements.txt
+#
+# The Julia bifurcation notebook has its own toolchain; see the README.
+
+# --- Core numerics / plotting ---
+numpy==2.4.4
+scipy==1.17.1
+matplotlib==3.10.8
+pandas==3.0.2
+
+# --- JAX / Flax modelling stack (whole-brain simulation) ---
+jax==0.8.0
+jaxlib==0.8.0
+flax==0.12.0
+optax==0.2.8
+orbax-checkpoint==0.11.36
+
+# --- Simulation-based inference ---
+sbi==0.26.1
+torch==2.11.0
+
+# --- Feature extraction from simulated BOLD ---
+vbi==0.4.3
+
+# --- Spiking QIF reference simulations ---
+brian2==2.10.1
+
+# --- Workflow / notebooks ---
+snakemake==9.19.0
+tqdm==4.67.3
+ipykernel==7.2.0
